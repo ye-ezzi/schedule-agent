@@ -1,0 +1,441 @@
+"""FastAPI REST API 서버.
+
+엔드포인트 목록:
+  POST /tasks                  - 태스크 생성 (AI 분해 포함)
+  GET  /tasks                  - 태스크 목록
+  GET  /tasks/{id}             - 태스크 상세
+  PATCH /tasks/{id}/complete   - 완료 처리
+  PATCH /tasks/{id}/priority   - 우선순위 변경
+  GET  /tasks/today            - 오늘 태스크
+
+  GET  /schedule/today         - 오늘 일정 블록
+  GET  /schedule/week          - 이번 주 일정
+  POST /schedule/blocks/{id}/reschedule  - 블록 재일정
+
+  GET  /capacity               - 7일 가용 시간 요약
+  POST /capacity/{date}        - 특정 날 가용 시간 설정
+
+  GET  /workload               - 전체 부하 분석
+
+  GET  /auth/google            - Google OAuth URL
+  GET  /auth/google/callback   - Google OAuth 콜백
+
+  POST /notifications/{id}/ack - 알림 확인 처리
+"""
+from __future__ import annotations
+
+from datetime import date, datetime
+from typing import Optional
+
+import pytz
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
+
+from config import settings
+from db.database import get_db, init_db
+from models.task import Priority, TaskStatus
+
+app = FastAPI(
+    title="Schedule Agent API",
+    description="Notion/Google Calendar/Apple Calendar 통합 스케줄 관리 에이전트",
+    version="1.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.on_event("startup")
+def on_startup():
+    init_db()
+
+
+# ─── Request/Response schemas ─────────────────────────────────────────────────
+
+class CreateTaskRequest(BaseModel):
+    title: str = Field(..., min_length=1, max_length=300)
+    description: str = ""
+    deadline: Optional[datetime] = None
+    priority: Optional[Priority] = None
+    project_id: Optional[int] = None
+    auto_breakdown: bool = True
+    sync_notion: bool = False
+    sync_google: bool = False
+    sync_apple: bool = False
+
+
+class UpdatePriorityRequest(BaseModel):
+    priority: Priority
+
+
+class CompleteTaskRequest(BaseModel):
+    actual_hours: Optional[float] = None
+
+
+class RescheduleRequest(BaseModel):
+    to_date: Optional[date] = None
+    reason: str = ""
+
+
+class SetCapacityRequest(BaseModel):
+    available_hours: float = Field(..., ge=0, le=24)
+    note: str = ""
+    is_holiday: bool = False
+
+
+class AckNotificationRequest(BaseModel):
+    response: Optional[dict] = None
+
+
+# ─── Tasks ────────────────────────────────────────────────────────────────────
+
+@app.post("/tasks", status_code=201)
+def create_task(req: CreateTaskRequest, db: Session = Depends(get_db)):
+    from core.task_manager import TaskManager
+
+    mgr = TaskManager(db)
+    task = mgr.create_task(
+        title=req.title,
+        description=req.description,
+        deadline=req.deadline,
+        priority=req.priority,
+        project_id=req.project_id,
+        auto_breakdown=req.auto_breakdown,
+    )
+    db.commit()
+
+    # 외부 동기화
+    _sync_task(task, db, req.sync_notion, req.sync_google, req.sync_apple)
+
+    return _task_response(task)
+
+
+@app.get("/tasks")
+def list_tasks(
+    status: Optional[TaskStatus] = None,
+    priority: Optional[Priority] = None,
+    project_id: Optional[int] = None,
+    limit: int = 50,
+    db: Session = Depends(get_db),
+):
+    from core.task_manager import TaskManager
+
+    mgr = TaskManager(db)
+    tasks = mgr.list_tasks(status=status, priority=priority, project_id=project_id, limit=limit)
+    return [_task_response(t) for t in tasks]
+
+
+@app.get("/tasks/today")
+def today_tasks(db: Session = Depends(get_db)):
+    from core.task_manager import TaskManager
+
+    mgr = TaskManager(db)
+    tasks = mgr.get_today_tasks()
+    return [_task_response(t) for t in tasks]
+
+
+@app.get("/tasks/{task_id}")
+def get_task(task_id: int, db: Session = Depends(get_db)):
+    from models.task import Task
+
+    task = db.get(Task, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return _task_response(task)
+
+
+@app.patch("/tasks/{task_id}/complete")
+def complete_task(task_id: int, req: CompleteTaskRequest, db: Session = Depends(get_db)):
+    from core.task_manager import TaskManager
+
+    mgr = TaskManager(db)
+    try:
+        task = mgr.complete_task(task_id, req.actual_hours)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    db.commit()
+
+    # Notion 동기화
+    if task.notion_page_id and settings.notion_api_key:
+        try:
+            from integrations.notion_client import NotionIntegration
+            NotionIntegration().complete_page(task)
+        except Exception:
+            pass
+
+    return _task_response(task)
+
+
+@app.patch("/tasks/{task_id}/priority")
+def update_priority(task_id: int, req: UpdatePriorityRequest, db: Session = Depends(get_db)):
+    from core.task_manager import TaskManager
+
+    mgr = TaskManager(db)
+    try:
+        task = mgr.update_priority(task_id, req.priority)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    db.commit()
+    return _task_response(task)
+
+
+# ─── Schedule ─────────────────────────────────────────────────────────────────
+
+@app.get("/schedule/today")
+def today_schedule(db: Session = Depends(get_db)):
+    from models.task import ScheduleBlock
+
+    tz = pytz.timezone(settings.timezone)
+    today = datetime.now(tz).date()
+    start = datetime(today.year, today.month, today.day, tzinfo=tz)
+    end = start.replace(hour=23, minute=59, second=59)
+
+    blocks = (
+        db.query(ScheduleBlock)
+        .filter(
+            ScheduleBlock.start_time >= start,
+            ScheduleBlock.start_time <= end,
+        )
+        .order_by(ScheduleBlock.start_time)
+        .all()
+    )
+    return [_block_response(b) for b in blocks]
+
+
+@app.get("/schedule/week")
+def week_schedule(db: Session = Depends(get_db)):
+    from datetime import timedelta
+    from models.task import ScheduleBlock
+
+    tz = pytz.timezone(settings.timezone)
+    today = datetime.now(tz).date()
+    start = datetime(today.year, today.month, today.day, tzinfo=tz)
+    end = start + timedelta(days=7)
+
+    blocks = (
+        db.query(ScheduleBlock)
+        .filter(
+            ScheduleBlock.start_time >= start,
+            ScheduleBlock.start_time < end,
+        )
+        .order_by(ScheduleBlock.start_time)
+        .all()
+    )
+    return [_block_response(b) for b in blocks]
+
+
+@app.post("/schedule/blocks/{block_id}/reschedule")
+def reschedule_block(block_id: int, req: RescheduleRequest, db: Session = Depends(get_db)):
+    from core.carryover import CarryoverService
+
+    svc = CarryoverService(db)
+    try:
+        new_block = svc.defer_block(block_id, to_date=req.to_date, reason=req.reason)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    db.commit()
+    return _block_response(new_block)
+
+
+# ─── Capacity ─────────────────────────────────────────────────────────────────
+
+@app.get("/capacity")
+def get_capacity(days: int = 7, db: Session = Depends(get_db)):
+    from core.capacity_planner import CapacityPlanner
+
+    planner = CapacityPlanner(db)
+    return planner.workload_summary(days=days)
+
+
+@app.post("/capacity/{target_date}")
+def set_capacity(target_date: date, req: SetCapacityRequest, db: Session = Depends(get_db)):
+    from core.capacity_planner import CapacityPlanner
+
+    planner = CapacityPlanner(db)
+    log = planner.set_daily_capacity(
+        target_date=target_date,
+        available_hours=req.available_hours,
+        note=req.note,
+        is_holiday=req.is_holiday,
+    )
+    db.commit()
+    return {
+        "date": target_date.isoformat(),
+        "available_hours": log.available_hours,
+        "scheduled_hours": log.scheduled_hours,
+        "is_holiday": log.is_holiday,
+    }
+
+
+# ─── Workload Analysis ────────────────────────────────────────────────────────
+
+@app.get("/workload")
+def analyze_workload(db: Session = Depends(get_db)):
+    from models.task import Task
+    from core.capacity_planner import CapacityPlanner
+    from ai.task_breakdown import TaskBreakdownEngine
+
+    if not settings.anthropic_api_key:
+        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured")
+
+    tasks = (
+        db.query(Task)
+        .filter(Task.status.in_([TaskStatus.PENDING, TaskStatus.IN_PROGRESS]))
+        .limit(20)
+        .all()
+    )
+    tasks_summary = [
+        {
+            "title": t.title,
+            "priority": t.priority.value,
+            "deadline": t.deadline.isoformat() if t.deadline else None,
+            "estimated_hours": t.estimated_hours,
+            "status": t.status.value,
+        }
+        for t in tasks
+    ]
+
+    planner = CapacityPlanner(db)
+    capacity_summary = planner.workload_summary(days=7)
+
+    engine = TaskBreakdownEngine()
+    result = engine.analyze_workload(tasks_summary, capacity_summary)
+    return result
+
+
+# ─── Google Auth ──────────────────────────────────────────────────────────────
+
+@app.get("/auth/google")
+def google_auth():
+    if not settings.google_client_id:
+        raise HTTPException(status_code=503, detail="Google OAuth not configured")
+    from integrations.google_calendar import GoogleCalendarIntegration
+    gcal = GoogleCalendarIntegration()
+    url = gcal.get_auth_url()
+    return {"auth_url": url}
+
+
+@app.get("/auth/google/callback")
+def google_callback(code: str):
+    from integrations.google_calendar import GoogleCalendarIntegration
+    gcal = GoogleCalendarIntegration()
+    gcal.handle_callback(code)
+    return {"message": "Google Calendar 인증 완료!"}
+
+
+# ─── Notifications ────────────────────────────────────────────────────────────
+
+@app.post("/notifications/{notification_id}/ack")
+def ack_notification(notification_id: int, req: AckNotificationRequest, db: Session = Depends(get_db)):
+    from notifications.notifier import Notifier
+    notifier = Notifier(db)
+    notifier.acknowledge(notification_id, req.response)
+    db.commit()
+    return {"acknowledged": True}
+
+
+@app.get("/notifications")
+def list_notifications(limit: int = 20, db: Session = Depends(get_db)):
+    from models.task import NotificationLog
+    logs = db.query(NotificationLog).order_by(NotificationLog.sent_at.desc()).limit(limit).all()
+    return [
+        {
+            "id": log.id,
+            "type": log.notification_type,
+            "message": log.message,
+            "channel": log.channel,
+            "sent_at": log.sent_at.isoformat(),
+            "acknowledged": log.acknowledged,
+        }
+        for log in logs
+    ]
+
+
+# ─── 헬퍼 ─────────────────────────────────────────────────────────────────────
+
+def _task_response(task) -> dict:
+    return {
+        "id": task.id,
+        "title": task.title,
+        "description": task.description,
+        "status": task.status.value,
+        "priority": task.priority.value,
+        "priority_score": task.priority_score,
+        "deadline": task.deadline.isoformat() if task.deadline else None,
+        "estimated_hours": task.estimated_hours,
+        "actual_hours": task.actual_hours,
+        "progress_pct": task.progress_pct,
+        "carry_over_count": task.carry_over_count,
+        "subtasks": [
+            {
+                "id": s.id,
+                "title": s.title,
+                "estimated_hours": s.estimated_hours,
+                "status": s.status.value,
+                "order": s.order,
+            }
+            for s in task.subtasks
+        ],
+        "notion_page_id": task.notion_page_id,
+        "google_event_id": task.google_event_id,
+        "created_at": task.created_at.isoformat(),
+    }
+
+
+def _block_response(block) -> dict:
+    tz = pytz.timezone(settings.timezone)
+    return {
+        "id": block.id,
+        "task_id": block.task_id,
+        "task_title": block.task.title if block.task else None,
+        "task_priority": block.task.priority.value if block.task else None,
+        "start_time": block.start_time.astimezone(tz).isoformat(),
+        "end_time": block.end_time.astimezone(tz).isoformat(),
+        "planned_hours": block.planned_hours,
+        "status": block.status.value,
+        "reschedule_count": block.reschedule_count,
+        "notification_sent": block.notification_sent,
+    }
+
+
+def _sync_task(task, db, sync_notion: bool, sync_google: bool, sync_apple: bool):
+    """태스크를 외부 서비스에 동기화."""
+    if sync_notion and settings.notion_api_key and settings.notion_tasks_database_id:
+        try:
+            from integrations.notion_client import NotionIntegration
+            notion = NotionIntegration()
+            page_id = notion.create_page(task)
+            task.notion_page_id = page_id
+            db.flush()
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).error(f"Notion sync failed: {e}")
+
+    if (sync_google or sync_apple) and task.schedule_blocks:
+        for block in task.schedule_blocks:
+            if sync_google and settings.google_client_id:
+                try:
+                    from integrations.google_calendar import GoogleCalendarIntegration
+                    gcal = GoogleCalendarIntegration()
+                    eid = gcal.create_event(block, task)
+                    block.google_event_id = eid
+                except Exception as e:
+                    import logging
+                    logging.getLogger(__name__).error(f"Google sync failed: {e}")
+
+            if sync_apple and settings.apple_caldav_username:
+                try:
+                    from integrations.apple_calendar import AppleCalendarIntegration
+                    acal = AppleCalendarIntegration()
+                    uid = acal.create_event(block, task)
+                    block.apple_event_uid = uid
+                except Exception as e:
+                    import logging
+                    logging.getLogger(__name__).error(f"Apple sync failed: {e}")
+        db.flush()
