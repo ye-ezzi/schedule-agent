@@ -124,6 +124,9 @@ def sync_to_gcal(task: dict) -> bool:
         text=True,
         timeout=120,
     )
+    if result.returncode != 0:
+        print(f"\n    [STDERR] {result.stderr[:300]}")
+        print(f"    [STDOUT] {result.stdout[:300]}")
     return result.returncode == 0
 
 
