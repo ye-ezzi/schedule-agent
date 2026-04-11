@@ -365,6 +365,100 @@ def reschedule(
     )
 
 
+@app.command("mcp-sync")
+def mcp_sync(
+    task_id: int = typer.Argument(..., help="동기화할 태스크 ID"),
+    notion: bool = typer.Option(True, "--notion/--no-notion", help="Notion 동기화"),
+    google: bool = typer.Option(True, "--google/--no-google", help="Google Calendar 동기화"),
+):
+    """
+    태스크의 MCP 동기화 페이로드를 출력합니다.
+
+    Claude Code가 이 출력을 읽고 MCP 도구(notion-create-pages,
+    gcal_create_event)를 직접 호출한 뒤, 반환된 ID를
+    PATCH /tasks/{id}/external-ids 로 저장합니다.
+
+    사용 예:
+      python main.py mcp-sync 1
+      → Claude에게 "이 페이로드로 Notion과 구글 캘린더에 동기화해줘" 라고 요청
+    """
+    import json
+    init_db()
+
+    with get_session() as session:
+        from models.task import Task
+        from integrations.mcp_helper import (
+            build_notion_page_payload,
+            build_gcal_event_payload,
+            NOTION_DB_DDL,
+        )
+
+        task = session.get(Task, task_id)
+        if not task:
+            console.print(f"[red]태스크 {task_id}를 찾을 수 없습니다.[/red]")
+            raise typer.Exit(1)
+
+        already_notion = bool(task.notion_page_id)
+        already_google = any(b.google_event_id for b in task.schedule_blocks)
+
+        console.print(Panel(
+            f"[bold]태스크:[/bold] {task.title}\n"
+            f"[bold]Notion 동기화:[/bold] {'이미 완료 (' + task.notion_page_id + ')' if already_notion else '미동기화'}'\n"
+            f"[bold]Google 동기화:[/bold] {'이미 완료' if already_google else '미동기화'}",
+            title="[cyan]MCP 동기화 페이로드[/cyan]",
+        ))
+
+        if notion and not already_notion:
+            notion_payload = build_notion_page_payload(task)
+            notion_parent: dict = {}
+            if settings.notion_tasks_database_id:
+                notion_parent = {"database_id": settings.notion_tasks_database_id, "type": "database_id"}
+            elif settings.notion_parent_page_id:
+                notion_parent = {"page_id": settings.notion_parent_page_id, "type": "page_id"}
+
+            console.print("\n[bold yellow]── Notion: notion-create-pages 호출 파라미터 ──[/bold yellow]")
+            console.print(f"[dim]parent:[/dim] {json.dumps(notion_parent, ensure_ascii=False)}")
+            console.print(f"[dim]pages:[/dim]")
+            console.print(json.dumps([notion_payload], ensure_ascii=False, indent=2))
+            console.print(
+                f"\n[dim]호출 후 반환된 page_id를 아래로 저장:[/dim]\n"
+                f"  PATCH /tasks/{task_id}/external-ids\n"
+                f"  Body: {{\"notion_page_id\": \"<반환된 page_id>\"}}"
+            )
+        elif already_notion:
+            console.print(f"\n[green]Notion 이미 동기화됨: {task.notion_page_id}[/green]")
+
+        if google and task.schedule_blocks:
+            console.print("\n[bold yellow]── Google Calendar: gcal_create_event 호출 파라미터 ──[/bold yellow]")
+            console.print(f"[dim]calendarId:[/dim] {settings.google_calendar_id}")
+            gcal_items = []
+            for block in task.schedule_blocks:
+                if block.google_event_id:
+                    console.print(f"  블록 {block.id}: 이미 동기화됨 ({block.google_event_id})")
+                    continue
+                event_payload = build_gcal_event_payload(block, task)
+                gcal_items.append({"block_id": block.id, "event": event_payload})
+                console.print(f"\n  [dim]블록 {block.id}:[/dim]")
+                console.print(json.dumps(event_payload, ensure_ascii=False, indent=2))
+
+            if gcal_items:
+                console.print(
+                    f"\n[dim]각 블록의 event_id를 아래로 저장:[/dim]\n"
+                    f"  PATCH /tasks/{task_id}/external-ids\n"
+                    f"  Body: {{\"google_event_ids\": ["
+                    + ", ".join(f'{{\"block_id\": {i[\"block_id\"]}, \"event_id\": \"<반환값>\"}}' for i in gcal_items)
+                    + "]}}"
+                )
+        elif not task.schedule_blocks:
+            console.print("\n[yellow]배정된 일정 블록이 없습니다. 먼저 태스크를 생성하세요.[/yellow]")
+
+        if not settings.notion_tasks_database_id and not settings.notion_parent_page_id:
+            console.print(
+                "\n[yellow]⚠ NOTION_TASKS_DATABASE_ID 또는 NOTION_PARENT_PAGE_ID를 .env에 설정하세요.[/yellow]\n"
+                f"Notion DB가 없다면 아래 DDL로 생성 가능합니다:\n{NOTION_DB_DDL}"
+            )
+
+
 @app.command("serve")
 def serve(
     host: str = typer.Option(settings.api_host, "--host"),

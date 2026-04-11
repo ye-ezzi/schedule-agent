@@ -1,12 +1,17 @@
 """FastAPI REST API 서버.
 
 엔드포인트 목록:
-  POST /tasks                  - 태스크 생성 (AI 분해 포함)
-  GET  /tasks                  - 태스크 목록
-  GET  /tasks/{id}             - 태스크 상세
-  PATCH /tasks/{id}/complete   - 완료 처리
-  PATCH /tasks/{id}/priority   - 우선순위 변경
-  GET  /tasks/today            - 오늘 태스크
+  POST /tasks                        - 태스크 생성 (AI 분해 포함)
+  GET  /tasks                        - 태스크 목록
+  GET  /tasks/{id}                   - 태스크 상세
+  PATCH /tasks/{id}/complete         - 완료 처리
+  PATCH /tasks/{id}/priority         - 우선순위 변경
+  GET  /tasks/today                  - 오늘 태스크
+
+  [MCP 동기화 엔드포인트]
+  GET  /tasks/{id}/mcp-payload       - Claude가 MCP 호출에 쓸 페이로드 반환
+  PATCH /tasks/{id}/external-ids     - MCP 호출 후 받은 외부 ID 저장
+  POST /schedule/capacity-from-gcal  - gcal_find_my_free_time 결과로 CapacityLog 업데이트
 
   GET  /schedule/today         - 오늘 일정 블록
   GET  /schedule/week          - 이번 주 일정
@@ -17,8 +22,8 @@
 
   GET  /workload               - 전체 부하 분석
 
-  GET  /auth/google            - Google OAuth URL
-  GET  /auth/google/callback   - Google OAuth 콜백
+  GET  /auth/google            - Google OAuth URL (SDK 폴백)
+  GET  /auth/google/callback   - Google OAuth 콜백 (SDK 폴백)
 
   POST /notifications/{id}/ack - 알림 확인 처리
 """
@@ -91,6 +96,24 @@ class SetCapacityRequest(BaseModel):
 
 class AckNotificationRequest(BaseModel):
     response: Optional[dict] = None
+
+
+# ─── MCP 관련 schemas ─────────────────────────────────────────────────────────
+
+class GoogleEventIdItem(BaseModel):
+    block_id: int
+    event_id: str
+
+
+class ExternalIdsRequest(BaseModel):
+    """Claude가 MCP 호출 후 받은 외부 ID를 저장."""
+    notion_page_id: Optional[str] = None
+    google_event_ids: Optional[list[GoogleEventIdItem]] = None  # 블록별 이벤트 ID
+
+
+class CapacityFromGcalRequest(BaseModel):
+    """gcal_find_my_free_time 파싱 결과를 받아 CapacityLog에 반영."""
+    free_slots: list[dict]  # [{"date": "YYYY-MM-DD", "free_hours": float}]
 
 
 # ─── Tasks ────────────────────────────────────────────────────────────────────
@@ -307,6 +330,128 @@ def analyze_workload(db: Session = Depends(get_db)):
     engine = TaskBreakdownEngine()
     result = engine.analyze_workload(tasks_summary, capacity_summary)
     return result
+
+
+# ─── MCP 동기화 ───────────────────────────────────────────────────────────────
+
+@app.get("/tasks/{task_id}/mcp-payload")
+def get_mcp_payload(task_id: int, db: Session = Depends(get_db)):
+    """
+    Claude가 MCP 도구를 호출할 때 사용할 페이로드를 반환한다.
+
+    반환값:
+      notion_payload  : notion-create-pages 의 pages[0] 항목
+      notion_parent   : {"database_id": ...} 또는 {"page_id": ...}
+      gcal_payloads   : [{"block_id", "event"}, ...]  gcal_create_event 의 event 파라미터
+      gcal_calendar_id: Google Calendar ID
+      already_synced  : {"notion": bool, "google": bool}
+    """
+    from models.task import Task, ScheduleBlock
+    from integrations.mcp_helper import build_notion_page_payload, build_gcal_event_payload
+
+    task = db.get(Task, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    # Notion 페이로드
+    notion_payload = build_notion_page_payload(task)
+    notion_parent: dict = {}
+    if settings.notion_tasks_database_id:
+        notion_parent = {"database_id": settings.notion_tasks_database_id, "type": "database_id"}
+    elif settings.notion_parent_page_id:
+        notion_parent = {"page_id": settings.notion_parent_page_id, "type": "page_id"}
+
+    # Google Calendar 페이로드 (블록별)
+    gcal_payloads = []
+    for block in task.schedule_blocks:
+        gcal_payloads.append({
+            "block_id": block.id,
+            "existing_event_id": block.google_event_id,
+            "event": build_gcal_event_payload(block, task),
+        })
+
+    return {
+        "task_id": task_id,
+        "task_title": task.title,
+        "notion_payload": notion_payload,
+        "notion_parent": notion_parent,
+        "gcal_payloads": gcal_payloads,
+        "gcal_calendar_id": settings.google_calendar_id,
+        "already_synced": {
+            "notion": bool(task.notion_page_id),
+            "google": any(b.google_event_id for b in task.schedule_blocks),
+        },
+    }
+
+
+@app.patch("/tasks/{task_id}/external-ids")
+def save_external_ids(task_id: int, req: ExternalIdsRequest, db: Session = Depends(get_db)):
+    """
+    Claude가 MCP 호출로 생성한 외부 ID를 DB에 저장한다.
+
+    - notion_page_id  → Task.notion_page_id
+    - google_event_ids[{block_id, event_id}] → ScheduleBlock.google_event_id
+    """
+    from models.task import Task, ScheduleBlock
+
+    task = db.get(Task, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    updated: dict = {}
+
+    if req.notion_page_id:
+        task.notion_page_id = req.notion_page_id
+        updated["notion_page_id"] = req.notion_page_id
+
+    if req.google_event_ids:
+        updated["google_event_ids"] = []
+        for item in req.google_event_ids:
+            block = db.get(ScheduleBlock, item.block_id)
+            if block and block.task_id == task_id:
+                block.google_event_id = item.event_id
+                updated["google_event_ids"].append({"block_id": item.block_id, "event_id": item.event_id})
+
+    db.commit()
+    return {"task_id": task_id, "updated": updated}
+
+
+@app.post("/schedule/capacity-from-gcal")
+def sync_capacity_from_gcal(req: CapacityFromGcalRequest, db: Session = Depends(get_db)):
+    """
+    gcal_find_my_free_time 결과(parse_gcal_free_slots 파싱 후)를 받아
+    CapacityLog를 업데이트한다.
+
+    기존 수동 설정(is_custom=True)은 덮어쓰지 않는다.
+    """
+    from datetime import date as date_type
+    from core.capacity_planner import CapacityPlanner
+
+    planner = CapacityPlanner(db)
+    results = []
+
+    for slot in req.free_slots:
+        try:
+            d = date_type.fromisoformat(slot["date"])
+            free_hours = float(slot["free_hours"])
+        except (KeyError, ValueError):
+            continue
+
+        cap = planner.get_or_create_capacity(d)
+        if cap.is_custom:
+            # 사용자가 수동 설정한 날은 건드리지 않음
+            results.append({"date": slot["date"], "action": "skipped_custom"})
+            continue
+
+        cap.available_hours = round(free_hours, 2)
+        results.append({
+            "date": slot["date"],
+            "available_hours": cap.available_hours,
+            "action": "updated",
+        })
+
+    db.commit()
+    return {"synced": len([r for r in results if r["action"] == "updated"]), "details": results}
 
 
 # ─── Google Auth ──────────────────────────────────────────────────────────────

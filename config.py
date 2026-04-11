@@ -36,6 +36,14 @@ class Settings(BaseSettings):
     slack_webhook_url: str = ""
     webhook_notify_url: str = ""
 
+    # MCP 동기화 모드
+    # True: Claude Code가 MCP 도구로 직접 동기화 (API 키 불필요)
+    # False: Python SDK 방식 (NOTION_API_KEY, Google OAuth 필요)
+    use_mcp_notion: bool = True
+    use_mcp_gcal: bool = True
+    # Notion 페이지 생성 위치 (DB ID가 없을 때 상위 페이지 ID로 대체)
+    notion_parent_page_id: str = ""
+
     # App
     database_url: str = "sqlite:///./schedule_agent.db"
     timezone: str = "Asia/Seoul"
