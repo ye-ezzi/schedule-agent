@@ -175,25 +175,49 @@ def get_tasks() -> list[dict]:
         name = title_arr[0]["plain_text"].strip()
 
         date_info = (p.get("실행기간") or {}).get("date") or {}
-        task_date = (date_info.get("start") or "")[:10]
-        if not task_date or task_date < today:
+        start_date = (date_info.get("start") or "")[:10]
+        end_date = (date_info.get("end") or "")[:10]
+
+        if not start_date:
             continue
 
-        hours = (p.get("예상시간") or {}).get("number") or 1.0
+        total_hours = (p.get("예상시간") or {}).get("number") or 1.0
 
         priority = (p.get("선택") or {}).get("select") or {}
         priority_name = (priority.get("name") or "").strip()
         p_config = PRIORITY_CONFIG.get(priority_name, {"color": "6", "emoji": "🟡", "order": 99})
 
-        tasks.append({
-            "name": name,
-            "date": task_date,
-            "hours": hours,
-            "priority": priority_name,
-            "color": p_config["color"],
-            "emoji": p_config["emoji"],
-            "order": p_config["order"],
-        })
+        # 날짜 범위 계산
+        start_dt = date.fromisoformat(start_date)
+        end_dt = date.fromisoformat(end_date) if end_date else start_dt
+        if end_dt < start_dt:
+            end_dt = start_dt
+
+        # 범위 내 모든 날짜 생성 (오늘 이전 날짜 제외)
+        all_days = []
+        current = start_dt
+        while current <= end_dt:
+            if current.isoformat() >= today:
+                all_days.append(current.isoformat())
+            current += timedelta(days=1)
+
+        if not all_days:
+            continue
+
+        # 하루치 시간 = 총 예상시간 / 전체 날짜 수 (소수점 2자리 반올림)
+        total_days = (end_dt - start_dt).days + 1
+        hours_per_day = round(total_hours / total_days, 2)
+
+        for day in all_days:
+            tasks.append({
+                "name": name,
+                "date": day,
+                "hours": hours_per_day,
+                "priority": priority_name,
+                "color": p_config["color"],
+                "emoji": p_config["emoji"],
+                "order": p_config["order"],
+            })
 
     tasks.sort(key=lambda t: (t["date"], t["order"]))
     return tasks
