@@ -119,7 +119,7 @@ def sync_to_gcal(task: dict) -> bool:
     )
 
     result = subprocess.run(
-        ["claude", "-p", prompt],
+        ["claude", "-p", prompt, "--dangerously-skip-permissions"],
         capture_output=True,
         text=True,
         timeout=120,
