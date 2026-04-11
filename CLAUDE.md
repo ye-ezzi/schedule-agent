@@ -18,29 +18,29 @@ Python 서버(SQLite) ←REST→ Claude Code ←MCP→ Notion / Google Calendar
 
 ## 1. 초기 설정 (최초 1회)
 
-### 1-1. Notion 데이터베이스 생성
+### 1-1. Notion 데이터베이스
 
-Notion에 태스크 DB가 없으면 `notion-create-database` MCP 도구로 생성합니다.
+기존 **"실행목표"** 데이터베이스를 사용합니다. 새 DB를 만들지 않습니다.
 
+| 항목 | 값 |
+|------|----|
+| DB 이름 | 실행목표 |
+| DB ID | `1501fffda2f645ab85e5db1ef47fc80e` |
+| 필터 기준 | 태그 = **구체적인 작업정리** |
+
+`.env` 설정:
 ```
-도구: notion-create-database
-파라미터:
-  title: "Schedule Agent Tasks"
-  parent: {"page_id": "<원하는 Notion 페이지 ID>", "type": "page_id"}
-  schema: |
-    CREATE TABLE tasks (
-      Name TEXT NOT NULL,
-      Status TEXT DEFAULT 'Not Started',
-      Priority TEXT DEFAULT '🟡 Medium',
-      Deadline DATE,
-      "Estimated Hours" NUMBER,
-      "Priority Score" NUMBER,
-      Description TEXT,
-      "Completed At" DATE
-    );
+NOTION_TASKS_DATABASE_ID=1501fffda2f645ab85e5db1ef47fc80e
 ```
 
-생성 후 반환된 `database_id`를 `.env`의 `NOTION_TASKS_DATABASE_ID`에 저장합니다.
+**스키마 매핑:**
+| schedule-agent 필드 | 실행목표 컬럼 | 비고 |
+|---------------------|--------------|------|
+| title | 작업 이름 | TITLE |
+| status | 상태 | 시작 전 / 진행 중 / 완료 |
+| deadline | 실행기간 (start) | DATE range |
+| 태그 (고정) | 태그 | ["구체적인 작업정리"] |
+| priority / estimated_hours / subtasks | 페이지 본문 | 마크다운으로 표시 |
 
 ### 1-2. Google Calendar 확인
 
@@ -79,7 +79,7 @@ GET /tasks/1/mcp-payload
 ```
 도구: notion-create-pages
 파라미터:
-  parent: <응답의 notion_parent>
+  parent: {"database_id": "1501fffda2f645ab85e5db1ef47fc80e", "type": "database_id"}
   pages:  [<응답의 notion_payload>]
 ```
 반환값에서 `id` (page_id) 추출.

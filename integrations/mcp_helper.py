@@ -3,12 +3,14 @@
 Claude Code가 Notion MCP / Google Calendar MCP 도구를 호출할 때 필요한
 입력 포맷으로 태스크·블록 데이터를 변환한다.
 
+대상 Notion DB: "실행목표" (1501fffda2f645ab85e5db1ef47fc80e)
+  - 태그가 "구체적인 작업정리"인 항목만 schedule-agent로 관리한다.
+
 사용 도구:
   Notion:
     notion-create-pages  → build_notion_page_payload()
     notion-update-page   → build_notion_update_payload()
     notion-search        → parse_notion_search_result()
-    notion-create-database → NOTION_DB_DDL
 
   Google Calendar:
     gcal_create_event      → build_gcal_event_payload()
@@ -28,20 +30,29 @@ _tz = pytz.timezone(settings.timezone)
 
 # ─── Notion ───────────────────────────────────────────────────────────────────
 
-# Notion DB를 처음 만들 때 사용하는 SQL DDL
+# "실행목표" DB의 스키마 정보 (참고용)
 NOTION_DB_DDL = """
-CREATE TABLE tasks (
-  Name TEXT NOT NULL,
-  Status TEXT DEFAULT 'Not Started',
-  Priority TEXT DEFAULT '🟡 Medium',
-  Deadline DATE,
-  "Estimated Hours" NUMBER,
-  "Priority Score" NUMBER,
-  Description TEXT,
-  "Completed At" DATE
-);
+-- 기존 "실행목표" 데이터베이스를 사용합니다.
+-- DB ID: 1501fffda2f645ab85e5db1ef47fc80e
+-- 태그: "구체적인 작업정리" 로 필터링하여 schedule-agent 태스크만 관리합니다.
+--
+-- 주요 컬럼:
+--   작업 이름  TEXT (TITLE)
+--   상태       TEXT ('시작 전' | '진행 중' | '완료' | '보관됨')
+--   태그       TEXT[] ('구체적인 작업정리' 포함)
+--   실행기간   DATE RANGE (start/end)
 """.strip()
 
+# schedule-agent 상태 → 실행목표 상태 매핑
+_STATUS_LABEL = {
+    "pending": "시작 전",
+    "in_progress": "진행 중",
+    "completed": "완료",
+    "deferred": "시작 전",
+    "cancelled": "보관됨",
+}
+
+# 우선순위 이모지 (페이지 본문에 표시)
 _PRIORITY_LABEL = {
     "critical": "🔴 Critical",
     "high": "🟠 High",
@@ -49,48 +60,52 @@ _PRIORITY_LABEL = {
     "low": "🟢 Low",
 }
 
-_STATUS_LABEL = {
-    "pending": "Not Started",
-    "in_progress": "In Progress",
-    "completed": "Done",
-    "deferred": "Deferred",
-    "cancelled": "Cancelled",
-}
+# schedule-agent 태그 식별자
+_SCHEDULE_AGENT_TAG = "구체적인 작업정리"
 
 
 def build_notion_page_payload(task) -> dict:
     """
     Task 객체 → notion-create-pages 의 pages[] 항목 1개.
 
+    "실행목표" DB 스키마에 맞게 변환한다.
+    태그에 "구체적인 작업정리"를 자동 포함한다.
+
     Claude 사용 예:
         payload = build_notion_page_payload(task)
         # notion-create-pages 호출:
-        #   parent = {"database_id": settings.notion_tasks_database_id}
+        #   parent = {"database_id": "1501fffda2f645ab85e5db1ef47fc80e"}
         #   pages  = [payload]
     """
     properties: dict = {
-        "Name": task.title,
-        "Status": _STATUS_LABEL.get(task.status.value, "Not Started"),
-        "Priority": _PRIORITY_LABEL.get(task.priority.value, "🟡 Medium"),
-        "Estimated Hours": task.estimated_hours or 0,
-        "Priority Score": task.priority_score or 0,
+        "작업 이름": task.title,
+        "상태": _STATUS_LABEL.get(task.status.value, "시작 전"),
+        "태그": json_dumps([_SCHEDULE_AGENT_TAG]),
     }
-    if task.deadline:
-        properties["Deadline"] = task.deadline.astimezone(_tz).strftime("%Y-%m-%d")
-    if task.description:
-        # AI 분석 텍스트는 Description에 포함하되 500자 제한
-        clean_desc = task.description.replace("[AI 분석]", "").strip()
-        properties["Description"] = clean_desc[:500]
 
-    # 페이지 본문 마크다운 생성
+    # 실행기간: deadline을 기간 시작일로 설정
+    if task.deadline:
+        deadline_str = task.deadline.astimezone(_tz).strftime("%Y-%m-%d")
+        properties["date:실행기간:start"] = deadline_str
+
+    # 페이지 본문: 우선순위·예상시간·설명·서브태스크를 마크다운으로
     content_parts = []
+
+    priority_label = _PRIORITY_LABEL.get(task.priority.value, "🟡 Medium")
+    hours = task.estimated_hours or 0
+    content_parts.append(f"**우선순위:** {priority_label}  |  **예상 소요시간:** {hours}h")
+
+    if task.description:
+        clean = task.description.replace("[AI 분석]", "").strip()
+        if clean:
+            content_parts.append(f"\n**설명:**\n{clean[:500]}")
+
     if task.subtasks:
-        content_parts.append("## 세부 작업")
+        content_parts.append("\n## 세부 작업")
         for st in sorted(task.subtasks, key=lambda s: s.order):
             done = "x" if st.status.value == "completed" else " "
             content_parts.append(f"- [{done}] {st.title} ({st.estimated_hours}h)")
 
-    # AI 분석 고려 사항 추출
     if task.description and "[AI 분석]" in task.description:
         ai_notes = task.description.split("[AI 분석]", 1)[1].strip()
         if ai_notes:
@@ -113,25 +128,24 @@ def build_notion_update_payload(task) -> dict:
     Claude 사용 예:
         props = build_notion_update_payload(task)
         # notion-update-page 호출:
-        #   page_id   = task.notion_page_id
-        #   command   = "update_properties"
+        #   page_id    = task.notion_page_id
+        #   command    = "update_properties"
         #   properties = props
     """
     props: dict = {
-        "Status": _STATUS_LABEL.get(task.status.value, "Not Started"),
-        "Priority": _PRIORITY_LABEL.get(task.priority.value, "🟡 Medium"),
-        "Priority Score": task.priority_score or 0,
+        "상태": _STATUS_LABEL.get(task.status.value, "시작 전"),
     }
     if task.status.value == "completed":
-        props["Completed At"] = datetime.now(_tz).strftime("%Y-%m-%d")
-    if task.estimated_hours:
-        props["Estimated Hours"] = task.estimated_hours
+        # 완료 시 기간 내 달성 여부 표시 (마감일 기준 판단 생략, 기본값 사용)
+        props["기간 내 달성"] = "기간 내 달성"
     return props
 
 
 def parse_notion_search_result(results: list[dict]) -> list[dict]:
     """
     notion-search 결과 → /tasks (POST) 로 임포트할 수 있는 dict 목록.
+
+    "구체적인 작업정리" 태그가 있는 항목만 반환한다.
 
     각 항목:
       title, description, deadline, priority, notion_page_id
@@ -142,29 +156,26 @@ def parse_notion_search_result(results: list[dict]) -> list[dict]:
             continue
         props = item.get("properties", {})
 
-        title = _extract_title(props)
+        # 태그 필터: "구체적인 작업정리" 가 없으면 건너뜀
+        tags = _extract_multi_select(props.get("태그", {}))
+        if _SCHEDULE_AGENT_TAG not in tags:
+            continue
+
+        title = _extract_title_by_key(props, "작업 이름")
         if not title:
-            # 일반 페이지(DB 항목 아닌 것)는 page title 사용
             title = item.get("title") or item.get("url", "")
 
+        # 실행기간 → deadline
         deadline = None
-        if props.get("Deadline", {}).get("date", {}).get("start"):
-            try:
-                deadline = props["Deadline"]["date"]["start"]
-            except (KeyError, TypeError):
-                pass
-
-        priority_label = (
-            props.get("Priority", {}).get("select", {}).get("name") or "🟡 Medium"
-        )
-        priority_map = {v: k for k, v in _PRIORITY_LABEL.items()}
-        priority = priority_map.get(priority_label, "medium")
+        exec_period = props.get("실행기간", {}).get("date", {})
+        if exec_period.get("start"):
+            deadline = exec_period["start"]
 
         tasks.append({
             "title": title,
-            "description": _extract_rich_text(props.get("Description", {})),
+            "description": "",
             "deadline": deadline,
-            "priority": priority,
+            "priority": "medium",  # 실행목표 DB엔 priority 없음
             "notion_page_id": item.get("id", ""),
         })
     return tasks
@@ -315,8 +326,23 @@ def parse_gcal_free_slots(
 
 # ─── 내부 유틸 ────────────────────────────────────────────────────────────────
 
+import json as _json
+
+
+def json_dumps(value) -> str:
+    """notion-create-pages의 multi_select 컬럼에 JSON 배열 전달."""
+    return _json.dumps(value, ensure_ascii=False)
+
+
+def _extract_title_by_key(props: dict, key: str) -> str:
+    rich = props.get(key, {}).get("title", [])
+    if rich:
+        return "".join(r.get("plain_text", "") for r in rich)
+    return ""
+
+
 def _extract_title(props: dict) -> str:
-    for key in ("Name", "Title", "title", "name"):
+    for key in ("작업 이름", "Name", "Title", "title", "name"):
         rich = props.get(key, {}).get("title", [])
         if rich:
             return "".join(r.get("plain_text", "") for r in rich)
@@ -326,6 +352,11 @@ def _extract_title(props: dict) -> str:
 def _extract_rich_text(prop: dict) -> str:
     rich = prop.get("rich_text", [])
     return "".join(r.get("plain_text", "") for r in rich)
+
+
+def _extract_multi_select(prop: dict) -> list[str]:
+    options = prop.get("multi_select", [])
+    return [o.get("name", "") for o in options]
 
 
 def _parse_rfc3339(s: str) -> datetime:
