@@ -145,11 +145,18 @@ def sync_to_gcal(task: dict) -> bool:
         f"빈 시간이 없으면 {task['date']} 09:00에 생성해줘."
     )
 
+    # claude CLI에 API 키 환경변수로 전달
+    env = os.environ.copy()
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if api_key:
+        env["ANTHROPIC_API_KEY"] = api_key
+
     result = subprocess.run(
         [CLAUDE_BIN, "-p", prompt, "--dangerously-skip-permissions"],
         capture_output=True,
         text=True,
         timeout=120,
+        env=env,
     )
     if result.returncode != 0:
         print(f"\n    [STDERR] {result.stderr[:300]}")
