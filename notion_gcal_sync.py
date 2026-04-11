@@ -21,6 +21,15 @@ TAG = "구체적인 작업정리"
 WORK_START = "09:00:00"
 WORK_END = "22:00:00"
 
+# P0~P4 → GCal colorId + 이모지 + 정렬 순서
+PRIORITY_CONFIG = {
+    "P0": {"color": "11", "emoji": "🔴", "order": 0},  # Tomato
+    "P1": {"color": "6",  "emoji": "🟠", "order": 1},  # Tangerine
+    "P2": {"color": "5",  "emoji": "🟡", "order": 2},  # Banana
+    "P3": {"color": "2",  "emoji": "🟢", "order": 3},  # Sage
+    "P4": {"color": "8",  "emoji": "⚪", "order": 4},  # Graphite
+}
+
 
 def get_tasks() -> list[dict]:
     """Notion에서 동기화 대상 태스크 조회."""
@@ -71,22 +80,41 @@ def get_tasks() -> list[dict]:
         # 예상시간 (없으면 1h)
         hours = (p.get("예상시간") or {}).get("number") or 1.0
 
-        tasks.append({"name": name, "date": task_date, "hours": hours})
+        # 중요도 (선택 컬럼: P0~P4)
+        priority = (p.get("선택") or {}).get("select", {})
+        priority_name = (priority.get("name") or "").strip() if priority else ""
+        p_config = PRIORITY_CONFIG.get(priority_name, {"color": "6", "emoji": "🟡", "order": 99})
 
+        tasks.append({
+            "name": name,
+            "date": task_date,
+            "hours": hours,
+            "priority": priority_name,
+            "color": p_config["color"],
+            "emoji": p_config["emoji"],
+            "order": p_config["order"],
+        })
+
+    # P0 우선 순으로 정렬
+    tasks.sort(key=lambda t: (t["date"], t["order"]))
     return tasks
 
 
 def sync_to_gcal(task: dict) -> bool:
     """Claude CLI를 통해 GCal에 이벤트 생성."""
+    title = f"{task['emoji']} {task['name']} ({task['hours']}h)"
+    priority_note = f"중요도: {task['priority']}" if task['priority'] else ""
+
     prompt = (
         f"구글 캘린더에 다음 태스크를 추가해줘:\n"
-        f"- 제목: {task['name']}\n"
+        f"- 제목: {title}\n"
         f"- 날짜: {task['date']}\n"
-        f"- 예상시간: {task['hours']}시간\n\n"
-        f"방법:\n"
+        f"- 예상시간: {task['hours']}시간\n"
+        + (f"- {priority_note}\n" if priority_note else "") +
+        f"\n방법:\n"
         f"1. gcal_find_my_free_time으로 {task['date']} {WORK_START}~{WORK_END} 빈 시간 조회 (minDuration={int(task['hours']*60)}분)\n"
         f"2. 첫 번째 빈 슬롯 시작 시간에 {task['hours']}시간짜리 이벤트 생성\n"
-        f"3. colorId=6 (Tangerine), timeZone=Asia/Seoul\n"
+        f"3. colorId={task['color']}, timeZone=Asia/Seoul\n"
         f"빈 시간이 없으면 {task['date']} 09:00에 생성해줘."
     )
 
@@ -121,7 +149,8 @@ def main():
     os.makedirs(os.path.join(os.path.dirname(__file__), "logs"), exist_ok=True)
 
     for task in tasks:
-        print(f"  → {task['name']} ({task['date']}, {task['hours']}h) ... ", end="", flush=True)
+        priority_label = f"[{task['priority']}] " if task['priority'] else ""
+        print(f"  → {task['emoji']} {priority_label}{task['name']} ({task['date']}, {task['hours']}h) ... ", end="", flush=True)
         try:
             ok = sync_to_gcal(task)
             print("✅" if ok else "❌ 실패")
