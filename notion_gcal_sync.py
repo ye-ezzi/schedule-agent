@@ -11,10 +11,37 @@ cron 예시:
   0 8 * * * cd /Users/iyeji/schedule-agent && python3 notion_gcal_sync.py >> logs/sync.log 2>&1
 """
 import os
+import shutil
 import subprocess
 import sys
 from datetime import date
 from notion_client import Client
+
+# claude CLI 경로 자동 탐색 (nvm/homebrew 등 다양한 설치 경로 대응)
+def _find_claude() -> str:
+    # 1. PATH에서 먼저 탐색
+    found = shutil.which("claude")
+    if found:
+        return found
+    # 2. 일반적인 설치 경로 순서대로 탐색
+    candidates = [
+        os.path.expanduser("~/.nvm/versions/node/v20/bin/claude"),
+        "/opt/homebrew/bin/claude",
+        "/usr/local/bin/claude",
+        os.path.expanduser("~/.npm-global/bin/claude"),
+    ]
+    # nvm 동적 경로 (버전 무관)
+    nvm_dir = os.path.expanduser("~/.nvm/versions/node")
+    if os.path.isdir(nvm_dir):
+        for ver in sorted(os.listdir(nvm_dir), reverse=True):
+            candidates.append(os.path.join(nvm_dir, ver, "bin", "claude"))
+
+    for path in candidates:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return "claude"  # fallback
+
+CLAUDE_BIN = _find_claude()
 
 NOTION_DB_ID = "1501fffda2f645ab85e5db1ef47fc80e"
 TAG = "구체적인 작업정리"
@@ -119,7 +146,7 @@ def sync_to_gcal(task: dict) -> bool:
     )
 
     result = subprocess.run(
-        ["claude", "-p", prompt, "--dangerously-skip-permissions"],
+        [CLAUDE_BIN, "-p", prompt, "--dangerously-skip-permissions"],
         capture_output=True,
         text=True,
         timeout=120,
@@ -160,7 +187,8 @@ def main():
         except subprocess.TimeoutExpired:
             print("❌ 타임아웃")
         except FileNotFoundError:
-            print("❌ claude CLI를 찾을 수 없습니다. 'claude --version' 확인하세요.")
+            print(f"❌ claude CLI를 찾을 수 없습니다. (탐색 경로: {CLAUDE_BIN})")
+            print("    'which claude' 로 경로 확인 후 CLAUDE_BIN 변수에 직접 입력하세요.")
             break
 
 
