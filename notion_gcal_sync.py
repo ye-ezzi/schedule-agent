@@ -41,7 +41,7 @@ def _find_claude() -> str:
             return path
     return "claude"  # fallback
 
-CLAUDE_BIN = _find_claude()
+CLAUDE_BIN = os.environ.get("CLAUDE_BIN", _find_claude())
 
 NOTION_DB_ID = "1501fffda2f645ab85e5db1ef47fc80e"
 TAG = "구체적인 작업정리"
