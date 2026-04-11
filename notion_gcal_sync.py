@@ -226,12 +226,24 @@ def get_tasks() -> list[dict]:
 # ─── 메인 ──────────────────────────────────────────────────────────────────
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dry-run", action="store_true", help="실제 생성 없이 동기화 대상만 출력")
+    args = parser.parse_args()
+
     load_env()
     tasks = get_tasks()
     today = date.today().isoformat()
     print(f"[{today}] 동기화 대상: {len(tasks)}개")
 
     if not tasks:
+        return
+
+    if args.dry_run:
+        print("🔍 [DRY RUN] 실제 이벤트는 생성되지 않습니다.\n")
+        for task in tasks:
+            priority_label = f"[{task['priority']}] " if task['priority'] else ""
+            print(f"  → {task['emoji']} {priority_label}{task['name']} ({task['date']}, {task['hours']}h)")
         return
 
     os.makedirs(os.path.join(BASE_DIR, "logs"), exist_ok=True)
