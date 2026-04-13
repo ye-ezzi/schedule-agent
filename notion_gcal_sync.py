@@ -133,7 +133,7 @@ def get_tasks(notion: Client) -> list[dict]:
 
         total_hours = (p.get("예상시간") or {}).get("number") or 1.0
 
-        priority = (p.get("선택") or {}).get("select") or {}
+        priority = (p.get("우선순위") or {}).get("select") or {}
         priority_name = (priority.get("name") or "").strip()
         p_config = PRIORITY_CONFIG.get(priority_name, {"color": "6", "emoji": "🟡", "order": 99})
 
