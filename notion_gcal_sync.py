@@ -84,6 +84,19 @@ def get_notion_client() -> Client:
 def ensure_notion_properties(notion: Client):
     """Notion DB에 동기화 추적 컬럼이 없으면 자동 추가."""
     db = notion.databases.retrieve(database_id=NOTION_DB_ID)
+    if db.get("object") == "error":
+        status = db.get("status", "?")
+        message = db.get("message", "알 수 없는 오류")
+        if status == 401:
+            print(f"❌ Notion 인증 실패 (401): NOTION_API_KEY가 올바른지, DB에 integration이 연결됐는지 확인하세요.")
+        elif status == 404:
+            print(f"❌ Notion DB를 찾을 수 없습니다 (404): DB ID={NOTION_DB_ID}")
+        else:
+            print(f"❌ Notion API 오류 ({status}): {message}")
+        sys.exit(1)
+    if "properties" not in db:
+        print(f"❌ Notion 응답에 properties 없음. 응답: {db}")
+        sys.exit(1)
     props = db["properties"]
     update_props = {}
     if GCAL_SYNCED_PROP not in props:
