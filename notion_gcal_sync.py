@@ -11,11 +11,12 @@ Notion 실행목표 DB → Google Calendar 자동 동기화
 완료 처리:
   - Notion 상태를 "완료"로 변경 시 다음 실행 때 GCal 이벤트 자동 삭제
 
+이월 처리:
+  - 날짜가 지났는데 완료 안 된 태스크는 오늘 날짜로 자동 이월
+
 최초 1회: python3 google_auth_setup.py 실행 필요
-cron 예시:
-  0 8  * * * cd /Users/iyeji/schedule-agent && /opt/homebrew/bin/python3 notion_gcal_sync.py >> logs/sync.log 2>&1
-  0 15 * * * cd /Users/iyeji/schedule-agent && /opt/homebrew/bin/python3 notion_gcal_sync.py >> logs/sync.log 2>&1
-  0 22 * * * cd /Users/iyeji/schedule-agent && /opt/homebrew/bin/python3 notion_gcal_sync.py >> logs/sync.log 2>&1
+cron 예시 (하루 1회, 아침):
+  0 8 * * * cd /Users/iyeji/schedule-agent && /opt/homebrew/bin/python3 notion_gcal_sync.py >> logs/sync.log 2>&1
 """
 import os
 import sys
@@ -186,6 +187,80 @@ def update_notion_sync_status(notion: Client, page_id: str, event_ids: list[str]
     )
 
 
+def carryover_tasks(service, notion: Client, dry_run: bool = False):
+    """날짜가 지났지만 완료되지 않은 태스크를 오늘로 이월."""
+    today = date.today().isoformat()
+
+    resp = notion.databases.query(
+        database_id=NOTION_DB_ID,
+        filter={
+            "and": [
+                {"property": "태그", "multi_select": {"contains": TAG}},
+                {
+                    "or": [
+                        {"property": "상태", "status": {"equals": "시작 전"}},
+                        {"property": "상태", "status": {"equals": "진행 중"}},
+                    ]
+                },
+                {"property": "실행기간", "date": {"before": today}},
+            ]
+        },
+    )
+
+    pages = resp.get("results", [])
+    if not pages:
+        return
+
+    print(f"🔄 이월 대상: {len(pages)}개")
+    for page in pages:
+        p = page["properties"]
+        page_id = page["id"]
+        name_arr = p.get("작업 이름", {}).get("title", [])
+        name = name_arr[0]["plain_text"].strip() if name_arr else "(이름 없음)"
+
+        date_info = (p.get("실행기간") or {}).get("date") or {}
+        old_start = (date_info.get("start") or "")[:10]
+        old_end = (date_info.get("end") or "")[:10]
+
+        # 종료일이 아직 안 지났으면 유지, 지났으면 단일 날짜로
+        new_end = old_end if (old_end and old_end >= today) else None
+
+        is_synced = p.get(GCAL_SYNCED_PROP, {}).get("checkbox", False)
+        event_ids_str = "".join(
+            r["plain_text"] for r in p.get(GCAL_EVENT_IDS_PROP, {}).get("rich_text", [])
+        )
+        event_ids = [e for e in event_ids_str.split(",") if e]
+
+        end_str = f" ~ {new_end}" if new_end else ""
+        print(f"  → 🔄 {name} ({old_start} → {today}{end_str}) ... ", end="", flush=True)
+
+        if dry_run:
+            print("[DRY RUN]")
+            continue
+
+        # 기존 GCal 이벤트 삭제
+        for eid in event_ids:
+            try:
+                service.events().delete(calendarId=CALENDAR_ID, eventId=eid).execute()
+            except Exception:
+                pass  # 이미 없는 이벤트면 무시
+
+        # Notion 날짜 + 동기화 상태 초기화
+        new_date: dict = {"start": today}
+        if new_end:
+            new_date["end"] = new_end
+
+        notion.pages.update(
+            page_id=page_id,
+            properties={
+                "실행기간": {"date": new_date},
+                GCAL_SYNCED_PROP: {"checkbox": False},
+                GCAL_EVENT_IDS_PROP: {"rich_text": []},
+            },
+        )
+        print("✅")
+
+
 def cleanup_completed_tasks(service, notion: Client, dry_run: bool = False):
     """완료된 태스크의 GCal 이벤트 삭제 후 Notion 필드 초기화."""
     resp = notion.databases.query(
@@ -338,7 +413,10 @@ def main():
     # 1. 완료 태스크 GCal 이벤트 정리
     cleanup_completed_tasks(service, notion, dry_run=args.dry_run)
 
-    # 2. 동기화 안 된 태스크 조회
+    # 2. 미완료 태스크 이월 (날짜 지난 것 → 오늘로)
+    carryover_tasks(service, notion, dry_run=args.dry_run)
+
+    # 3. 동기화 안 된 태스크 조회
     tasks = get_tasks(notion)
     print(f"[{today}] 동기화 대상: {len(tasks)}개")
 
