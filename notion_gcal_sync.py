@@ -95,8 +95,9 @@ def ensure_notion_properties(notion: Client):
             print(f"❌ Notion API 오류 ({status}): {message}")
         sys.exit(1)
     if "properties" not in db:
-        print(f"❌ Notion 응답에 properties 없음. 응답: {db}")
-        sys.exit(1)
+        # linked database는 properties를 반환하지 않음 → 컬럼이 이미 있다고 가정하고 계속 진행
+        print("ℹ️  linked DB라 properties 조회 불가 → 컬럼 자동 추가 건너뜀")
+        return
     props = db["properties"]
     update_props = {}
     if GCAL_SYNCED_PROP not in props:
