@@ -116,12 +116,7 @@ def get_tasks(notion: Client) -> list[dict]:
         filter={
             "and": [
                 {"property": "태그", "multi_select": {"contains": TAG}},
-                {
-                    "or": [
-                        {"property": "상태", "status": {"equals": "시작 전"}},
-                        {"property": "상태", "status": {"equals": "진행 중"}},
-                    ]
-                },
+                {"property": "상태", "status": {"equals": "진행 중"}},
                 {"property": GCAL_SYNCED_PROP, "checkbox": {"equals": False}},
             ]
         },
