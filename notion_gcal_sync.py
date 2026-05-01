@@ -419,10 +419,7 @@ def main():
     os.makedirs(os.path.join(BASE_DIR, "logs"), exist_ok=True)
     service = get_gcal_service()
 
-    # 1. 완료 태스크 GCal 이벤트 정리
-    cleanup_completed_tasks(service, notion, dry_run=args.dry_run)
-
-    # 2. 미완료 태스크 이월 (날짜 지난 것 → 오늘로)
+    # 1. 미완료 태스크 이월 (날짜 지난 것 → 오늘로)
     carryover_tasks(service, notion, dry_run=args.dry_run)
 
     # 3. 동기화 안 된 태스크 조회
